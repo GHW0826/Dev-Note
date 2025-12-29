@@ -47,6 +47,14 @@ EPOLL_CTL_DEL : 제거
 
 
 ### 레벨 트리거
+리스너를 epoll에 붙였을 때의 처리 흐름 <br>
+리스너는 보통 EPOLLIN으로 등록하고, 이벤트가 오면:
+레벨 트리거(default): 이벤트 한 번 받고 accept()를 1번만 해도 또 남아있으면 계속 깨워줌
+엣지 트리거(EPOLLET): 이벤트 한 번 오면 accept를 EAGAIN까지 전부 소진해야 함 (안 그러면 다음 이벤트가 안 올 수 있음)
+전형적인 accept 루프(개념):
+while (true) { cfd = accept(); if (cfd == -1 && errno == EAGAIN) break; ... }
+새로 받은 cfd도 set_nonblock(cfd) 하고 epoll에 EPOLLIN | EPOLLRDHUP 등으로 등록
+
 레벨 트리거(LT) vs 엣지 트리거(ET)
 
 - 서버 품질에 중요
@@ -140,3 +148,101 @@ accept는 한 곳에서 받고, 연결을 라운드로빈으로 epoll 스레드�
 네트워크 스레드는 I/O만, 파싱 후 “Job Queue”에 넣고 워커가 처리
 장점: 네트워크 레이턴시 안정
 단점: 작업 순서/동기화 설계가 핵심(세션별 직렬화 등)
+
+### Code Example
+```cpp
+// Create Listener socker
+int create_listen_socket(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+      close(fd);
+      return -1;
+    }
+    if (listen(fd, SOMAXCONN) < 0) {
+      close(fd);
+      return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      close(fd);
+      return -1;
+    }
+
+    return fd;
+}
+
+
+// SO_REUSEADDR
+// 서버 재시작할 때 흔히 만나는 bind: Address already in use 완화용
+// 특히 이전 연결들이 TIME_WAIT 상태로 남아있는 동안 같은 포트에 다시 bind가 막히는 상황을 줄여줌
+setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+// SO_REUSEPORT
+// 동일 (IP, Port)에 여러 프로세스/스레드가 각각 bind+listen 가능하게 해줌
+// 커널이 들어오는 연결을 여러 리스너에 분산해줌(로드밸런싱 비슷)
+// 커널 버전/설정/해시 정책에 따라 분산 특성이 달라질 수 있음
+// 이미 단일 accept 스레드 + 워커 이벤트루프 구조라면 굳이 필요 없을 때도 많음
+setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+// epoll은 리스너 FD가 지금 읽을 수 있다/쓸 수 있다를 알려주는데, 그 상태에서도:
+// accept(), recv(), send()는 타이밍에 따라 바로 다음 호출이 블록될 수 있음
+// 그래서 이벤트 루프가 멈추지 않으려면 non-blocking + EAGAIN 처리가 기본 패턴
+// Listener 소켓의 옵션을 load
+int flags = fcntl(fd, F_GETFL, 0);
+// 이후 해당 소켓에 논블락 옵션을 추가.
+fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+
+// epoll 인스턴스를 만듦
+// 반환되는 epfd가 이후 모든 epoll 호출의 핸들이 됨
+// EPOLL_CLOEXEC는 exec 시 fd 누수 방지(서버에서는 보통 켜둠)
+int epfd = epoll_create1(EPOLL_CLOEXEC);
+
+// epoll_ctl() — FD 등록/수정/삭제
+// EPOLL_CTL_ADD : 감시 대상 추가
+// EPOLL_CTL_MOD : 이벤트 마스크 수정(예: EPOLLOUT 추가/제거)
+// EPOLL_CTL_DEL : 감시에서 제거
+struct epoll_event ev{};
+ev.events = EPOLLIN;      // 읽기 가능(accept 가능/recv 가능)
+ev.data.fd = listen_fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
+
+// events 플래그 자주 쓰는 것들
+//   EPOLLIN : 읽기 가능
+//     리스너: accept 가능한 연결이 생김
+//     클라 소켓: recv 가능한 데이터가 있음(또는 FIN으로 0바이트 읽힘)
+//   EPOLLOUT : 쓰기 가능(버퍼 여유가 있어 send가 “진행될 가능성”이 큼)
+//   EPOLLRDHUP : 상대가 half-close(쓰기 종료) 했을 때 감지(실전에서 유용)
+//   EPOLLHUP / EPOLLERR : 끊김/에러 (대개 항상 체크)
+//   EPOLLET : Edge Trigger(엣지 트리거)
+//     이벤트가 상태 변화에서만 옴
+//     반드시 논블로킹 + while 루프 EAGAIN까지 drain 패턴 필요
+
+
+// epoll_wait() — 이벤트 받기
+epoll_event events[1024];
+int n = epoll_wait(epfd, events, 1024, timeout_ms);
+
+// 준비된 이벤트를 최대 maxevents개까지 받아옴
+// 반환값 n만큼 events[i]를 처리
+//   timeout_ms:
+//     -1 무한 대기
+//     0 폴링(즉시 리턴)
+
+```
