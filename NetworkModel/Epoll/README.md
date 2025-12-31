@@ -27,38 +27,47 @@
 > 접속자가 100명이든 10만 명이든, 이벤트 수 기준으로 동작
 
 ## 3. epoll 내부 구조
-### 3.1 Interest List (관심 목록)
+### Interest List (관심 목록)
 - `epoll_ctl(ADD / MOD / DEL)` 로 관리
 - 어떤 FD를, 어떤 이벤트(읽기/쓰기/종료 등)로 감시할지 등록
-### 3.2 Ready List (준비된 목록)
+### Ready List (준비된 목록)
 - 실제로 이벤트가 발생한 FD만 들어가는 리스트
 - `epoll_wait()` 는 이 Ready List에서 이벤트를 꺼내 반환
 
 
 
 ### API
-1. epoll_create1(flags)
+### epoll_create1
+```c
+int epfd = epoll_create1(EPOLL_CLOEXEC);
+```
 - epoll 인스턴스(커널 객체) 생성
-- 보통 EPOLL_CLOEXEC 같이 준다 (exec 계열에서 fd 누수 방지)
-<br>
+- EPOLL_CLOEXEC: exec() 시 FD 누수 방지
 
-2.  epoll_ctl(epfd, op, fd, &ev)
-- 관심 목록 제어
-- op: <br>
-EPOLL_CTL_ADD : 등록
-EPOLL_CTL_MOD : 이벤트 마스크 변경(예: out 큐 생기면 EPOLLOUT 추가)
-EPOLL_CTL_DEL : 제거
-<br>
 
-3. epoll_wait(epfd, events, maxevents, timeout)
-- ready list에서 이벤트를 가져옴
-- 반환: 이벤트 개수
-- timeout = -1이면 무한 대기
-<br>
+```c
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+```
+- EPOLL_CTL_ADD	: 감시 대상 등록
+- EPOLL_CTL_MOD	: 이벤트 마스크 변경
+- EPOLL_CTL_DEL :	감시 대상 제거
 
-4. 소켓 I/O: accept4, read/recv, write/send
-- epoll은 이벤트 통지만 하고 실제 데이터 I/O는 여전히 read/write로 함
-- non-blocking은 사실상 필수 전제 (EAGAIN 루프 패턴)
+```c
+int n = epoll_wait(epfd, events, maxevents, timeout);
+```
+- Ready List에서 이벤트를 가져옴
+- 반환값: 이벤트 개수
+- timeout = -1 → 무한 대기
+- timeout = 0 → 폴링(즉시 리턴)
+
+
+### epoll은 이벤트 통지만 함.
+- epoll은 I/O를 대신 수행하지 않음
+- 실제 데이터 처리는 accept / recv / send
+- epoll 준비만 알려줌
+- 따라서 non-blocking + EAGAIN 루프 패턴이 사실상 필수
 
 
 ### 레벨 트리거
